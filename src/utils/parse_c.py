@@ -4,17 +4,64 @@ from pathlib import Path
 import re
 import copy
 import sys
-from tree_sitter import Language, Parser
 import subprocess
 
 FILE_PATH = Path(__file__)
-Language.build_library(
-    FILE_PATH.parent / "c_build/my-languages.so",
-    [FILE_PATH.parent.parent / "resources/tree-sitter-c"],
-)
-C_LANGUAGE = Language(str(FILE_PATH.parent / "c_build/my-languages.so"), "c")
-PARSER = Parser()
-PARSER.set_language(C_LANGUAGE)
+
+# NOTE: `tree_sitter` is an optional dependency for some workflows (e.g. Codex CLI scaffold).
+# Some environments (notably locked-down sandboxes / minimal Conda envs) may not have it.
+# We load it lazily and degrade gracefully when unavailable.
+try:
+    from tree_sitter import Language, Parser  # type: ignore
+
+    _HAS_TREE_SITTER = True
+except Exception:
+    Language = None  # type: ignore
+    Parser = None  # type: ignore
+    _HAS_TREE_SITTER = False
+
+_PARSER = None
+_TREE_SITTER_WARNED = False
+
+
+def _get_parser():
+    """
+    Lazily build/load the tree-sitter C parser.
+    Returns a configured Parser(), or None if tree_sitter isn't available.
+    """
+    global _PARSER
+    if not _HAS_TREE_SITTER:
+        return None
+    if _PARSER is not None:
+        return _PARSER
+
+    # Build the language library if needed.
+    so_path = FILE_PATH.parent / "c_build" / "my-languages.so"
+    so_path.parent.mkdir(parents=True, exist_ok=True)
+    if not so_path.exists():
+        # This may require a local toolchain; if it fails, we let callers handle it.
+        Language.build_library(  # type: ignore[attr-defined]
+            str(so_path),
+            [str(FILE_PATH.parent.parent / "resources" / "tree-sitter-c")],
+        )
+
+    c_lang = Language(str(so_path), "c")  # type: ignore[operator]
+    parser = Parser()  # type: ignore[operator]
+    parser.set_language(c_lang)
+    _PARSER = parser
+    return _PARSER
+
+
+def _warn_tree_sitter_missing_once() -> None:
+    global _TREE_SITTER_WARNED
+    if _TREE_SITTER_WARNED:
+        return
+    _TREE_SITTER_WARNED = True
+    print(
+        "[CRUST-bench] WARNING: Python package `tree_sitter` is not available. "
+        "C AST-based header extraction will be skipped (safe for scaffold / Codex CLI workflows).",
+        file=sys.stderr,
+    )
 
 
 def find_dependencies(benchmark):
@@ -74,7 +121,12 @@ def order_dependencies(benchmark):
 
 
 def extract_function_declarations_and_globals(source_code):
-    tree = PARSER.parse(source_code.encode("utf8"))
+    parser = _get_parser()
+    if parser is None:
+        _warn_tree_sitter_missing_once()
+        return [], [], []
+
+    tree = parser.parse(source_code.encode("utf8"))
     root_node = tree.root_node
 
     functions = []
@@ -131,7 +183,12 @@ def extract_function_declarations_and_globals(source_code):
 
 
 def get_c_functions(source_code):
-    tree = PARSER.parse(bytes(source_code, "utf8"))
+    parser = _get_parser()
+    if parser is None:
+        _warn_tree_sitter_missing_once()
+        return []
+
+    tree = parser.parse(bytes(source_code, "utf8"))
     root_node = tree.root_node
     functions = []
     try:
@@ -265,6 +322,12 @@ def generate_header_file(functions, globals, structs):
 
 
 def get_header_files(benchmark):
+    # If tree_sitter isn't available, skip AST-based header extraction. This is fine for
+    # scaffold-only workflows because we still copy raw .c/.h sources into metadata.
+    if _get_parser() is None:
+        _warn_tree_sitter_missing_once()
+        return []
+
     all_header_files = []
     c_file_dict = {f["file_name"]: f["content"] for f in benchmark.c_files}
 

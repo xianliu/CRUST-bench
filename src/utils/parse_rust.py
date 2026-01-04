@@ -1,29 +1,71 @@
 from pathlib import Path
 import json
 from tqdm import tqdm
-from tree_sitter import Language, Parser
 import sys
 import os
 import re
 
 FILE_PATH = Path(__file__)
-print(FILE_PATH)
-# Build and include the Rust language library
-Language.build_library(
-    FILE_PATH.parent / "rust_build/my-languages.so",
-    [FILE_PATH.parent.parent / "resources/tree-sitter-rust"],
-)
 
-RUST_LANGUAGE = Language(str(FILE_PATH.parent / "rust_build/my-languages.so"), "rust")
+# NOTE: `tree_sitter` is an optional dependency for some workflows (e.g. Codex CLI scaffold).
+# Some environments may not have it; load lazily and degrade gracefully.
+try:
+    from tree_sitter import Language, Parser  # type: ignore
+
+    _HAS_TREE_SITTER = True
+except Exception:
+    Language = None  # type: ignore
+    Parser = None  # type: ignore
+    _HAS_TREE_SITTER = False
+
+_PARSER = None
+_TREE_SITTER_WARNED = False
+
+
+def _get_parser():
+    global _PARSER
+    if not _HAS_TREE_SITTER:
+        return None
+    if _PARSER is not None:
+        return _PARSER
+
+    so_path = FILE_PATH.parent / "rust_build" / "my-languages.so"
+    so_path.parent.mkdir(parents=True, exist_ok=True)
+    if not so_path.exists():
+        Language.build_library(  # type: ignore[attr-defined]
+            str(so_path),
+            [str(FILE_PATH.parent.parent / "resources" / "tree-sitter-rust")],
+        )
+    rust_language = Language(str(so_path), "rust")  # type: ignore[operator]
+    parser = Parser()  # type: ignore[operator]
+    parser.set_language(rust_language)
+    _PARSER = parser
+    return _PARSER
+
+
+def _warn_tree_sitter_missing_once() -> None:
+    global _TREE_SITTER_WARNED
+    if _TREE_SITTER_WARNED:
+        return
+    _TREE_SITTER_WARNED = True
+    print(
+        "[CRUST-bench] WARNING: Python package `tree_sitter` is not available. "
+        "Rust AST-based signature extraction will be skipped (safe for scaffold / Codex CLI workflows).",
+        file=sys.stderr,
+    )
+
+
+RUST_LANGUAGE = None
 EMPTY_MAIN_STRING = 'fn main() {\n    println!("Hello, world!");\n}'
-# Initialize the parser
-PARSER = Parser()
-PARSER.set_language(RUST_LANGUAGE)
 
 
 def function_signture_builder(rust_code):
     # Parse the Rust code and get the root node
-    tree = PARSER.parse(bytes(rust_code, "utf-8"))
+    parser = _get_parser()
+    if parser is None:
+        _warn_tree_sitter_missing_once()
+        return ""
+    tree = parser.parse(bytes(rust_code, "utf-8"))
     root_node = tree.root_node
     return traverse(root_node, rust_code)
 
@@ -118,7 +160,11 @@ def get_function_parameters(fn_node, code):
 
 def get_rust_functions(code):
     # Parse the Rust code and get the root node
-    tree = PARSER.parse(code.encode())
+    parser = _get_parser()
+    if parser is None:
+        _warn_tree_sitter_missing_once()
+        return []
+    tree = parser.parse(code.encode())
     root_node = tree.root_node
     return get_rust_functions_util(root_node, code)
 

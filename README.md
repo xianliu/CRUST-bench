@@ -225,3 +225,25 @@ CCF-2210831, CCF-2319471, and and by the Defense Advanced Research Projects Agen
 (DARPA) under Agreement No. HR00112590133. We also thank the All Hands AI team
 for a discussion on the OpenHands CodeAct agentic framework applied to the C-to-Rust
 transpilation task.
+
+### Validating with the official Codex CLI agent (interactive exploration)
+
+This repository includes Codex CLI helper scripts under `scripts/codex_cli/`.
+
+Agent-only workflow (Codex CLI fully implements stubs):
+
+```bash
+source .venv/bin/activate
+python scripts/codex_cli/verify_benchmark.py \
+  --benchmark file2str \
+  --timeout-sec 120 \
+  --model gpt-5-mini \
+  --output-dir outputs/codex_cli_verify_file2str
+```
+
+Batch workflow (10 benchmarks):
+
+```bash
+source .venv/bin/activate
+python scripts/codex_cli/verify_batch.py --timeout-sec 600 --model openai/gpt-5-mini --output-root outputs/codex_cli_batch_10_gpt5mini_600s
+```

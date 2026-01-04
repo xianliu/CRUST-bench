@@ -1,33 +1,82 @@
+import argparse
+import csv
 import json
 import os
-import sys
-import csv
-from pathlib import Path
-import argparse
-from benchmark import load_benchmarks
-from prompter import (
-    Prompter,
-    RepairPrompter,
-)
-from transpiler import Transpiler, TranspilerN
-from test_repairer import TestRepairer
-from utils.rust_project_builder import write_rust_files, write_rust_multi_files, create_top_level_cargo_toml
-from utils.compile_rust_utils import (
-    final_error_report,
-    get_errors_for_iteration,
-    final_test_report,
-    aggregate_results,
-    performance_stats
-)
 import shutil
-from endpoint_config import endpoint_resolver
-from compile_projects import compile, test
-from repairer import Repairer
-from utils.parse_c import order_dependencies
-from understand_errors import (
-    get_numbers,
-    process_proj
-)
+import sys
+from pathlib import Path
+
+from benchmark import load_benchmarks_filtered
+from utils.rust_project_builder import create_top_level_cargo_toml
+
+
+def _scaffold_mode(args) -> None:
+    """
+    Scaffold-only: prepare output Rust crate(s) for agent-based workflows (Codex CLI).
+
+    IMPORTANT: Keep imports here minimal and avoid importing any endpoint clients
+    (Anthropic/OpenAI/etc). This mode should work in restricted environments and
+    doesn't call any model.
+    """
+    # Create workspace top-level Cargo.toml
+    create_top_level_cargo_toml(Path(args.output_dir))
+
+    benchmarks = load_benchmarks_filtered(
+        Path(args.benchmark_dir), Path(args.output_dir), single_benchmark=args.single_benchmark
+    )
+
+    # If user provided an RBench directory, copy it into each scaffolded output crate.
+    if args.rust_dir:
+        rust_dir = Path(args.rust_dir)
+        ignore_vcs = shutil.ignore_patterns(".git", ".vscode", ".DS_Store")
+        for b in benchmarks:
+            shutil.rmtree(b.rust_path, ignore_errors=True)
+            src1 = rust_dir / b.project_name
+            src2 = rust_dir / (b.project_name[0].upper() + b.project_name[1:]) if b.project_name else None
+            if src1.exists():
+                shutil.copytree(src1, b.rust_path, ignore=ignore_vcs)
+            elif src2 and src2.exists():
+                shutil.copytree(src2, b.rust_path, ignore=ignore_vcs)
+            else:
+                raise FileNotFoundError(f"Rust project not found for {b.project_name} under {rust_dir}")
+        # Reload benchmarks so paths + rust_headers/tests are refreshed.
+        benchmarks = load_benchmarks_filtered(
+            Path(args.benchmark_dir), Path(args.output_dir), single_benchmark=args.single_benchmark
+        )
+        assert all(len(b.rust_headers) > 0 for b in benchmarks), "Rust path not copied correctly"
+
+    for b in benchmarks:
+        # Materialize interface stubs as module files under src/ so the crate builds.
+        interfaces_dir = b.rust_path / "src" / "interfaces"
+        if interfaces_dir.exists():
+            lib_rs = b.rust_path / "src" / "lib.rs"
+            lib_content = lib_rs.read_text(encoding="utf-8") if lib_rs.exists() else ""
+            for iface in interfaces_dir.glob("*.rs"):
+                module_dst = b.rust_path / "src" / iface.name
+                if not module_dst.exists():
+                    # Keep a single source of truth in src/interfaces/*.rs so agents
+                    # can implement the stubs there without worrying about duplicates.
+                    module_dst.write_text(f'include!("interfaces/{iface.name}");\n', encoding="utf-8")
+                mod_line = f"pub mod {iface.stem};"
+                if mod_line not in lib_content:
+                    lib_content = (lib_content.rstrip() + "\n" + mod_line + "\n").lstrip("\n")
+            if lib_rs.exists():
+                lib_rs.write_text(lib_content, encoding="utf-8")
+            else:
+                lib_rs.write_text(lib_content + "\n", encoding="utf-8")
+
+        # Copy C sources into metadata for agent reference.
+        c_src_dir = b.rust_path / "metadata" / "c_src"
+        c_src_dir.mkdir(parents=True, exist_ok=True)
+        seen = set()
+        for f in (b.c_files + b.c_headers):
+            name = f["file_name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            (c_src_dir / name).write_text(f["content"], encoding="utf-8")
+
+    print(f"Scaffolded {len(benchmarks)} benchmark(s) under: {args.output_dir}")
 
 
 class Runner:
@@ -52,7 +101,11 @@ class Runner:
         self.benchmark_dir = Path(benchmark_dir)
         self.output_dir = Path(output_dir)
 
-        self.benchmarks = load_benchmarks(self.benchmark_dir, self.output_dir)
+        # Filter early so we don't instantiate / scaffold Rust projects for all benchmarks
+        # when the user only wants a single one (Benchmark() can run `cargo new`).
+        self.benchmarks = load_benchmarks_filtered(
+            self.benchmark_dir, self.output_dir, single_benchmark=single_benchmark
+        )
         self.prompt = prompt
         self.prompt_format = prompt_format
         self.prompt_strategy = prompt_strategy
@@ -78,18 +131,12 @@ class Runner:
                         rust_dir + "/" + benchmark.project_name, benchmark.rust_path
                     )
             # we need to reload the benchmarks given that we have changed the rust path
-            self.benchmarks = load_benchmarks(self.benchmark_dir, self.output_dir)
+            self.benchmarks = load_benchmarks_filtered(
+                self.benchmark_dir, self.output_dir, single_benchmark=single_benchmark
+            )
             assert all(
                 len(benchmark.rust_headers) > 0 for benchmark in self.benchmarks
             ), "Rust path not copied correctly"
-        if single_benchmark:
-            # check if start with a number
-            if single_benchmark[0].isdigit():
-                single_benchmark = "proj_" + single_benchmark
-            single_benchmark = single_benchmark.replace("-", "_")
-            self.benchmarks = [
-                b for b in self.benchmarks if b.project_name == single_benchmark
-            ]
         # dump a config log
         print(f'''
         Number of benchmarks: {len(self.benchmarks)}
@@ -107,6 +154,13 @@ class Runner:
  
 
     def transpile(self):
+        # Heavy imports (endpoint clients, LLM plumbing) are deferred so scaffold mode
+        # can run without extra deps / SSL requirements.
+        from prompter import Prompter
+        from transpiler import Transpiler
+        from compile_projects import compile
+        from utils.rust_project_builder import write_rust_files
+
         prompter = Prompter(
             self.prompt, self.prompt_format, self.prompt_strategy, self.include_headers
         )
@@ -122,6 +176,11 @@ class Runner:
         compile_results = compile(self.output_dir, 0)
 
     def repair(self):
+        from prompter import RepairPrompter
+        from repairer import Repairer
+        from compile_projects import compile
+        from utils.rust_project_builder import write_rust_files
+
         compile_results = []
         for i in range(self.iterations):
             repair_prompter = RepairPrompter(
@@ -141,6 +200,18 @@ class Runner:
         
 
     def multi_gen(self):
+        from prompter import Prompter
+        from transpiler import TranspilerN
+        from compile_projects import compile
+        from utils.rust_project_builder import write_rust_multi_files, create_top_level_cargo_toml
+        from utils.compile_rust_utils import (
+            aggregate_results,
+            final_error_report,
+            final_test_report,
+            get_errors_for_iteration,
+            performance_stats,
+        )
+
         prompter = Prompter(
             self.prompt, self.prompt_format, self.prompt_strategy, self.include_headers
         )
@@ -163,7 +234,11 @@ class Runner:
         # get ready for repair
         self.benchmarks = []
         for i in range(self.n):
-            self.benchmarks = load_benchmarks(self.benchmark_dir , self.output_dir / str(i))
+            # multi_gen does not support per-run single_benchmark filtering here; each output
+            # directory is already scoped to this run.
+            self.benchmarks = load_benchmarks_filtered(
+                self.benchmark_dir, self.output_dir / str(i)
+            )
             compile_results = compile(self.output_dir / str(i), 0)
             self.repair()
             self.get_loc()
@@ -193,6 +268,14 @@ class Runner:
                 csv_writer.writerow([benchmark.project_name, c_loc, rust_loc, builds])
 
     def test_perf(self):
+        from utils.compile_rust_utils import (
+            final_error_report,
+            final_test_report,
+            get_errors_for_iteration,
+            performance_stats,
+        )
+        from understand_errors import get_numbers, process_proj
+
         self.transpile()
         self.repair()
         self.get_loc()
@@ -211,6 +294,14 @@ class Runner:
 
 
 def main(args):
+    print("mode:", args.mode)
+    if args.mode == "scaffold":
+        _scaffold_mode(args)
+        return
+
+    # Heavy-mode imports below (avoid endpoint client init in scaffold mode)
+    from endpoint_config import endpoint_resolver
+
     config = endpoint_resolver(args.config, args.endpoint)
     runner = Runner(
         benchmark_dir=args.benchmark_dir,
@@ -229,11 +320,6 @@ def main(args):
         rust_dir=args.rust_dir,
         n=args.n,
     )
-    config = {}
-    print("mode:", args.mode)
-    if args.config:
-        with open(args.config, "r") as f:
-            config = json.load(f)
     if args.mode == "normal":
         runner.test_perf()
     elif args.mode == "multi_gen":
@@ -249,7 +335,12 @@ if __name__ == "__main__":
     argparser.add_argument("--rust_dir", type=str, required=False, help="Path to the Rust project (RBench) directory")
     argparser.add_argument("--output_dir", type=str, required=True, help="Path to the output directory")
     argparser.add_argument("--prompt", type=str, required=True, help="Prompt to use for the model")
-    argparser.add_argument("--mode", type=str, default="normal", help="The mode(normal, multi_gen), that does the transpilation")
+    argparser.add_argument(
+        "--mode",
+        type=str,
+        default="normal",
+        help="The mode(normal, multi_gen, scaffold). scaffold only creates output crate(s) for agent-based repair.",
+    )
     argparser.add_argument("--endpoint", type=str, required=True, help="Endpoint to use for the model. Look at the `endpoints/call_endpoint.py` for more information.")
     argparser.add_argument("--prompt_format", type=str, required=True, help="Format of the prompt (markdown, bullet_point)")
     argparser.add_argument("--prompt_strategy", type=str, required=False, default="all", help="Strategy to use for the prompt (all- all files are appended to the prompt)")

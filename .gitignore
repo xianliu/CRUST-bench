@@ -1,5 +1,10 @@
 datasets/CBench/
 datasets/RBench/
+datasets/CRUST_bench/
+outputs/
+.codex_migration_backups/
 **/__pycache__/
 **/cache/
 **/results/
+.env
+.DS_Store

@@ -103,6 +103,28 @@ def write_rust_files(benchmark):
                         f"[dependencies]\n{dep} = {{ workspace = true }}\n",
                     )
             file.write(content)
+
+
+def ensure_workspace_deps(cargo_toml_path: Path) -> None:
+    """
+    Ensure the crate's Cargo.toml references the shared workspace dependencies.
+
+    This is used both for normal transpilation (write_rust_files) and for
+    "scaffold-only" flows where we copy an RBench crate and want it to build
+    under the top-level workspace without rewriting lib.rs.
+    """
+    if not cargo_toml_path.exists():
+        return
+    content = cargo_toml_path.read_text(encoding="utf-8")
+    updated = content
+    for dep in DEPENDENCIES:
+        if dep not in updated:
+            updated = updated.replace(
+                "[dependencies]",
+                f"[dependencies]\n{dep} = {{ workspace = true }}\n",
+            )
+    if updated != content:
+        cargo_toml_path.write_text(updated, encoding="utf-8")
     
 
 def write_rust_multi_files(benchmark_cand, i):

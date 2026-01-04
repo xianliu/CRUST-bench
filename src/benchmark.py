@@ -32,12 +32,37 @@ def load_benchmarks(input_dir, output_dir):
     print(f"Loaded {len(benchmarks)} benchmarks")
     return benchmarks
 
+def normalize_project_name(name: str) -> str:
+    """Normalize a project directory name into the CRUST-bench internal project name."""
+    project_name = name.replace("-", "_")
+    if project_name and project_name[0].isdigit():
+        project_name = "proj_" + project_name
+    if len(project_name.split(".")) > 1:
+        project_name = project_name.split(".")[0]
+    return project_name
+
+
+def load_benchmarks_filtered(input_dir, output_dir, single_benchmark=None):
+    """Load benchmarks, optionally filtering to a single benchmark before creating projects."""
+    benchmarks = []
+    filter_name = normalize_project_name(single_benchmark) if single_benchmark else None
+    print(f"Loading benchmarks from {input_dir}")
+    for proj in os.listdir(input_dir):
+        if not os.path.isdir(f"{input_dir}/{proj}"):
+            continue
+        if filter_name and normalize_project_name(proj) != filter_name:
+            continue
+        benchmarks.append(Benchmark(f"{input_dir}/{proj}", f"{output_dir}/{proj}"))
+    print(f"Loaded {len(benchmarks)} benchmarks")
+    return benchmarks
+
+
 
 class Benchmark:
     def __init__(self, c_path, rust_path):
         self.c_path = Path(c_path)
 
-        self.project_name = self.c_path.name.replace("-", "_")
+        self.project_name = normalize_project_name(self.c_path.name)
         if self.project_name[0].isdigit():
             self.project_name = "proj_" + self.project_name
         if len(self.project_name.split(".")) > 1:
