@@ -226,24 +226,151 @@ CCF-2210831, CCF-2319471, and and by the Defense Advanced Research Projects Agen
 for a discussion on the OpenHands CodeAct agentic framework applied to the C-to-Rust
 transpilation task.
 
-### Validating with the official Codex CLI agent (interactive exploration)
+### Validating with the official Codex CLI agent
 
-This repository includes Codex CLI helper scripts under `scripts/codex_cli/`.
+This repository includes Codex CLI helper scripts under `scripts/codex_cli/` that use the OpenAI Codex CLI agent to automatically implement Rust stubs and verify correctness.
 
-Agent-only workflow (Codex CLI fully implements stubs):
+#### Prerequisites
+
+1. **Install OpenAI Codex CLI**:
+   ```bash
+   npm i -g @openai/codex
+   # or
+   brew install codex
+   ```
+
+2. **Configure API Key**:
+   
+   Create a `.env` file in the repository root:
+   ```bash
+   echo "OPENAI_API_KEY=sk-proj-YOUR_API_KEY_HERE" > .env
+   ```
+   
+   Then login with Codex CLI:
+   ```bash
+   codex login --with-api-key
+   # Enter your API key when prompted, or:
+   cat .env | grep OPENAI_API_KEY | cut -d'=' -f2 | codex login --with-api-key
+   ```
+
+#### Single Benchmark Verification
+
+Verify a single benchmark using Codex CLI:
 
 ```bash
-source .venv/bin/activate
 python scripts/codex_cli/verify_benchmark.py \
-  --benchmark file2str \
+  --benchmark 2DPartInt \
   --timeout-sec 120 \
-  --model gpt-5-mini \
-  --output-dir outputs/codex_cli_verify_file2str
+  --model gpt-5-nano \
+  --output-dir outputs/codex_cli_verify_2DPartInt
 ```
 
-Batch workflow (10 benchmarks):
+**Parameters:**
+- `--benchmark`: Benchmark name (e.g., `2DPartInt`, `file2str`, `c_blind_rsa_signatures`)
+- `--timeout-sec`: Maximum time in seconds for Codex agent to work on the benchmark (default: 120)
+- `--model`: OpenAI model to use (e.g., `gpt-5-nano`, `gpt-5-mini`, `gpt-4o`)
+- `--output-dir`: Output directory for results
 
+**Output files:**
+- `reward.txt`: `1` if all tests pass, `0` otherwise
+- `job.log`: Execution log
+- `codex_cli.log`: Full Codex CLI agent interaction log
+- `run.log`: Scaffold and test execution log
+- `test_report.csv`: Test results summary
+- `error_report.csv`: Compilation/test errors (if any)
+
+#### Batch Verification
+
+Verify multiple benchmarks in parallel:
+
+**Default batch (10 benchmarks):**
 ```bash
-source .venv/bin/activate
-python scripts/codex_cli/verify_batch.py --timeout-sec 600 --model openai/gpt-5-mini --output-root outputs/codex_cli_batch_10_gpt5mini_600s
+python scripts/codex_cli/verify_batch.py \
+  --timeout-sec 600 \
+  --model gpt-5-nano \
+  --jobs 10 \
+  --output-root outputs/codex_cli_batch_10
+```
+
+**Custom benchmark list:**
+```bash
+python scripts/codex_cli/verify_batch.py \
+  --benchmarks "2DPartInt,file2str,aes128-SIMD" \
+  --timeout-sec 600 \
+  --model gpt-5-nano \
+  --jobs 5 \
+  --output-root outputs/codex_cli_batch_custom
+```
+
+**All 100 benchmarks:**
+```bash
+# Get all benchmark names
+BENCHES=$(python - <<'PY'
+from pathlib import Path
+cb = Path('datasets/CRUST_bench/CBench')
+items = sorted([p.name for p in cb.iterdir() if p.is_dir() and not p.name.startswith('.')])
+print(','.join(items))
+PY
+)
+
+# Run batch verification
+python scripts/codex_cli/verify_batch.py \
+  --benchmarks "$BENCHES" \
+  --timeout-sec 600 \
+  --model gpt-5-nano \
+  --jobs 10 \
+  --retries 0 \
+  --output-root outputs/codex_cli_batch_100_$(date +%Y%m%d_%H%M%S)
+```
+
+**Batch parameters:**
+- `--benchmarks`: Comma-separated list of benchmark names (default: 10 benchmarks from screenshot)
+- `--timeout-sec`: Timeout per benchmark in seconds (default: 120)
+- `--model`: OpenAI model to use (default: `gpt-5-nano`)
+- `--jobs`: Number of parallel jobs (default: 1, sequential)
+- `--retries`: Number of retries for failed benchmarks (default: 0)
+- `--output-root`: Root directory for all benchmark outputs
+
+**Batch output files:**
+- `<output-root>/batch.log`: Batch execution log with progress
+- `<output-root>/batch_results.csv`: Summary CSV with columns:
+  - `benchmark`: Benchmark name
+  - `reward`: `1` if passed, `0` if failed
+  - `verify_exit`: Exit code of verification script
+  - `seconds`: Time taken
+  - `attempts`: Number of attempts (if retries enabled)
+  - `output_dir`: Path to benchmark output directory
+  - `job_log`, `codex_log`, `run_log`: Paths to log files
+  - `error`: Error message (if any)
+
+**Background execution:**
+```bash
+# Create output directory first
+OUT=outputs/codex_cli_batch_100_$(date +%Y%m%d_%H%M%S)
+mkdir -p "$OUT"
+
+# Run in background with nohup
+nohup python scripts/codex_cli/verify_batch.py \
+  --benchmarks "$BENCHES" \
+  --timeout-sec 600 \
+  --model gpt-5-nano \
+  --jobs 20 \
+  --output-root "$OUT" \
+  > "$OUT/nohup.log" 2>&1 &
+
+# Monitor progress
+tail -f "$OUT/batch.log"
+tail -f "$OUT/batch_results.csv"
+```
+
+**Check progress:**
+```bash
+# Count completed benchmarks
+wc -l outputs/codex_cli_batch_100_*/batch_results.csv
+
+# Count passed benchmarks
+grep -c ",1," outputs/codex_cli_batch_100_*/batch_results.csv
+
+# View latest results
+tail -20 outputs/codex_cli_batch_100_*/batch_results.csv
 ```
